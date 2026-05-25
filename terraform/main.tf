@@ -9,11 +9,21 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = var.region
 }
 
 variable "public_key" {
   type = string
+}
+
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "project_name" {
+  type    = string
+  default = "testweb4"
 }
 
 variable "instance_type" {
@@ -132,4 +142,8 @@ output "instance_id" {
 
 output "ssh_user" {
   value = "ubuntu"
+}
+
+output "public_ip" {
+  value = aws_instance.app.public_ip
 }
