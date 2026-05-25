@@ -1,4 +1,4 @@
-name: Deploy node to EC2
+name: Deploy testweb4 node to EC2
 
 on:
   workflow_dispatch:
@@ -17,6 +17,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -24,12 +29,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
-
-      - name: Terraform Init
+      - name: Terraform init
         working-directory: terraform
         run: |
           terraform init -reconfigure \
@@ -37,7 +37,7 @@ jobs:
             -backend-config="region=us-east-1" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Terraform Apply
+      - name: Terraform apply
         working-directory: terraform
         run: |
           terraform apply -auto-approve \
@@ -50,28 +50,25 @@ jobs:
         working-directory: terraform
         run: |
           SERVER_IP=$(terraform output -raw public_ip)
-          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+          echo "server_ip=${SERVER_IP}" >> "$GITHUB_OUTPUT"
 
   configure:
-    name: Configure EC2 with Ansible
+    name: Configure EC2 and Deploy with Ansible
     runs-on: ubuntu-latest
     needs: provision
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install Ansible
-        run: pip install ansible
-
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible
 
       - name: Write SSH private key
         run: |
@@ -79,27 +76,25 @@ jobs:
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-      - name: Wait for SSH to be available
+      - name: Wait for EC2 SSH to be ready
         run: |
           SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          echo "Waiting for SSH on $SERVER_IP..."
+          echo "Waiting for SSH on ${SERVER_IP}..."
           for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/deploy_key ubuntu@$SERVER_IP echo "SSH ready" 2>/dev/null; then
-              echo "SSH is available"
-              exit 0
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/deploy_key ubuntu@${SERVER_IP} "echo ok" 2>/dev/null; then
+              echo "SSH is ready."
+              break
             fi
-            echo "Attempt $i/30 failed, retrying in 10 seconds..."
+            echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done
-          echo "SSH never became available"
-          exit 1
 
       - name: Write Ansible playbook
         run: |
           mkdir -p ansible
           cat > ansible/playbook.yml << 'PLAYBOOK_EOF'
           ---
-          - name: Deploy Node.js app to EC2
+          - name: Deploy testweb4 node on EC2
             hosts: all
             become: yes
             vars:
@@ -108,26 +103,40 @@ jobs:
               node_version: "20"
 
             tasks:
+
               - name: Update apt cache
                 apt:
                   update_cache: yes
                   cache_valid_time: 3600
 
-              - name: Install required packages
+              - name: Install system dependencies
                 apt:
                   name:
                     - curl
                     - git
                     - nginx
                     - build-essential
+                    - ca-certificates
+                    - gnupg
                   state: present
 
-              - name: Install Node.js 20 via NodeSource
+              - name: Add NodeSource GPG key
                 shell: |
-                  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-                  apt-get install -y nodejs
+                  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
                 args:
-                  creates: /usr/bin/node
+                  creates: /etc/apt/keyrings/nodesource.gpg
+
+              - name: Add NodeSource repository for Node.js 20
+                shell: |
+                  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+                args:
+                  creates: /etc/apt/sources.list.d/nodesource.list
+
+              - name: Install Node.js 20
+                apt:
+                  name: nodejs
+                  state: present
+                  update_cache: yes
 
               - name: Install PM2 globally
                 npm:
@@ -135,96 +144,87 @@ jobs:
                   global: yes
                   state: present
 
-              - name: Install PostgreSQL
+              - name: Install Java 21
                 apt:
-                  name: postgresql
+                  name: openjdk-21-jdk
                   state: present
+
+              - name: Install Python 3.11 and pip
+                apt:
+                  name:
+                    - python3.11
+                    - python3.11-venv
+                    - python3-pip
+                  state: present
+
+              - name: Install local database (postgres)
+                shell: |
+                  apt-get install -y postgresql
                 when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
 
               - name: Fix PostgreSQL SCRAM auth to md5
                 shell: |
-                  PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
-                  sed -i 's/scram-sha-256/md5/g' "$PG_HBA"
+                  HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+                  sed -i 's/scram-sha-256/md5/g' "$HBA"
                   systemctl reload postgresql
                 when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
 
-              - name: Create PostgreSQL database
+              - name: Create PostgreSQL database and user
                 shell: |
-                  sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};" 2>/dev/null || true
-                when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
-
-              - name: Create PostgreSQL user
-                shell: |
-                  sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';" 2>/dev/null || true
-                when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
-
-              - name: Grant PostgreSQL privileges
-                shell: |
-                  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};" 2>/dev/null || true
+                  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name | default('') }}'" | grep -q 1 || \
+                    sudo -u postgres psql -c "CREATE DATABASE {{ db_name | default('appdb') }};"
+                  sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username | default('') }}'" | grep -q 1 || \
+                    sudo -u postgres psql -c "CREATE USER {{ db_username | default('appuser') }} WITH ENCRYPTED PASSWORD '{{ db_password | default('') }}';"
+                  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name | default('appdb') }} TO {{ db_username | default('appuser') }};"
                 when: install_db | default('') == 'true' and db_type | default('') == 'postgres'
 
               - name: Install MySQL
-                apt:
-                  name: mysql-server
-                  state: present
-                when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
-
-              - name: Create MySQL database and user
                 shell: |
-                  mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
-                  mysql -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}';"
-                  mysql -e "GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost';"
+                  apt-get install -y mysql-server
                 when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
 
-              - name: Install MongoDB prerequisites
-                apt:
-                  name:
-                    - gnupg
-                    - curl
-                  state: present
-                when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
+              - name: Configure MySQL database and user
+                shell: |
+                  mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name | default('appdb') }};"
+                  mysql -e "CREATE USER IF NOT EXISTS '{{ db_username | default('appuser') }}'@'localhost' IDENTIFIED BY '{{ db_password | default('') }}';"
+                  mysql -e "GRANT ALL ON {{ db_name | default('appdb') }}.* TO '{{ db_username | default('appuser') }}'@'localhost';"
+                when: install_db | default('') == 'true' and db_type | default('') == 'mysql'
 
               - name: Install MongoDB
                 shell: |
-                  curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
-                  echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-7.0.list
-                  apt-get update
+                  curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+                  echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list
+                  apt-get update -y
                   apt-get install -y mongodb-org
-                when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
-
-              - name: Start and enable MongoDB
-                systemd:
-                  name: mongod
-                  state: started
-                  enabled: yes
+                  systemctl start mongod
+                  systemctl enable mongod
                 when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
 
               - name: Initialize MongoDB database
                 shell: |
-                  mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")' 2>/dev/null || true
+                  mongosh --eval 'db.getSiblingDB("{{ db_name | default('appdb') }}").createCollection("init")'
                 when: install_db | default('') == 'true' and db_type | default('') == 'mongodb'
 
-              - name: Create app directory
+              - name: Ensure app directory exists
                 file:
                   path: "{{ app_dir }}"
                   state: directory
                   owner: "{{ app_user }}"
                   group: "{{ app_user }}"
-                  mode: '0755'
+                  mode: "0755"
 
-              - name: Sync application files
+              - name: Sync application code
                 synchronize:
                   src: "{{ playbook_dir }}/../"
                   dest: "{{ app_dir }}/"
-                  delete: yes
                   rsync_opts:
                     - "--exclude=.git"
                     - "--exclude=node_modules"
                     - "--exclude=.github"
                     - "--exclude=terraform"
                     - "--exclude=ansible"
-                    - "--exclude=*.log"
-                become: no
+                    - "--delete"
+                delegate_to: localhost
 
               - name: Set app directory ownership
                 file:
@@ -237,49 +237,53 @@ jobs:
               - name: Write .env file
                 shell: |
                   printf '' > {{ app_dir }}/.env
-                  [ -n "{{ node_env_database_url | default('') }}" ] && echo "DATABASE_URL={{ node_env_database_url }}" >> {{ app_dir }}/.env || true
-                  [ -n "{{ node_env_mongo_uri | default('') }}" ] && echo "MONGO_URI={{ node_env_mongo_uri }}" >> {{ app_dir }}/.env || true
-                  [ -n "{{ node_env_db_host | default('') }}" ] && echo "DB_HOST={{ node_env_db_host }}" >> {{ app_dir }}/.env || true
-                  [ -n "{{ node_env_db_port | default('') }}" ] && echo "DB_PORT={{ node_env_db_port }}" >> {{ app_dir }}/.env || true
-                  [ -n "{{ node_env_db_name | default('') }}" ] && echo "DB_NAME={{ node_env_db_name }}" >> {{ app_dir }}/.env || true
-                  [ -n "{{ node_env_db_user | default('') }}" ] && echo "DB_USER={{ node_env_db_user }}" >> {{ app_dir }}/.env || true
-                  [ -n "{{ node_env_db_password | default('') }}" ] && echo "DB_PASSWORD={{ node_env_db_password }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_database_url | default('') }}" ] && echo "DATABASE_URL={{ node_env_database_url | default('') }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_mongo_uri | default('') }}" ] && echo "MONGO_URI={{ node_env_mongo_uri | default('') }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_host | default('') }}" ] && echo "DB_HOST={{ node_env_db_host | default('') }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_port | default('') }}" ] && echo "DB_PORT={{ node_env_db_port | default('') }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_name | default('') }}" ] && echo "DB_NAME={{ node_env_db_name | default('') }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_user | default('') }}" ] && echo "DB_USER={{ node_env_db_user | default('') }}" >> {{ app_dir }}/.env || true
+                  [ -n "{{ node_env_db_password | default('') }}" ] && echo "DB_PASSWORD={{ node_env_db_password | default('') }}" >> {{ app_dir }}/.env || true
                   echo "PORT=3000" >> {{ app_dir }}/.env
                   echo "HOST=0.0.0.0" >> {{ app_dir }}/.env
-                  chown {{ app_user }}:{{ app_user }} {{ app_dir }}/.env
-                  chmod 600 {{ app_dir }}/.env
+                args:
+                  executable: /bin/bash
+
+              - name: Set .env file ownership
+                file:
+                  path: "{{ app_dir }}/.env"
+                  owner: "{{ app_user }}"
+                  group: "{{ app_user }}"
+                  mode: "0600"
 
               - name: Install npm dependencies
                 shell: |
                   cd {{ app_dir }}
                   npm install --production
-                become: yes
                 become_user: "{{ app_user }}"
 
-              - name: Run build if build script exists
+              - name: Run npm build if build script exists
                 shell: |
                   cd {{ app_dir }}
-                  if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)" 2>/dev/null; then
+                  if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1);" 2>/dev/null; then
                     npm run build
                   fi
-                become: yes
                 become_user: "{{ app_user }}"
 
-              - name: Stop existing PM2 app
+              - name: Delete existing PM2 app
                 shell: |
                   pm2 delete app 2>/dev/null || true
-                become: yes
                 become_user: "{{ app_user }}"
 
-              - name: Start app with PM2
+              - name: Start application with PM2
                 shell: |
+                  cd {{ app_dir }}
                   set -a
                   [ -f {{ app_dir }}/.env ] && . {{ app_dir }}/.env
                   export PORT=${PORT:-3000}
                   export HOST=${HOST:-0.0.0.0}
                   set +a
-                  cd {{ app_dir }}
-                  if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.start ? 0 : 1)" 2>/dev/null; then
+                  if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.start ? 0 : 1);" 2>/dev/null; then
                     pm2 start npm --name app -- start --update-env
                   elif [ -f {{ app_dir }}/server.js ]; then
                     pm2 start {{ app_dir }}/server.js --name app --update-env
@@ -288,15 +292,14 @@ jobs:
                   elif [ -f {{ app_dir }}/app.js ]; then
                     pm2 start {{ app_dir }}/app.js --name app --update-env
                   else
-                    echo "ERROR: No valid entrypoint found"
+                    echo "ERROR: No valid entrypoint found" >&2
                     exit 1
                   fi
-                become: yes
                 become_user: "{{ app_user }}"
 
               - name: Save PM2 process list
-                shell: pm2 save
-                become: yes
+                shell: |
+                  pm2 save
                 become_user: "{{ app_user }}"
 
               - name: Setup PM2 startup systemd service
@@ -305,27 +308,7 @@ jobs:
                 args:
                   creates: /etc/systemd/system/pm2-ubuntu.service
 
-              - name: Wait for app to be ready
-                wait_for:
-                  host: 127.0.0.1
-                  port: 3000
-                  timeout: 120
-                  delay: 10
-                ignore_errors: yes
-                register: wait_result
-
-              - name: Print PM2 logs on failure
-                shell: pm2 logs app --lines 50 --nostream
-                become: yes
-                become_user: "{{ app_user }}"
-                when: wait_result is failed
-
-              - name: Fail if app did not start
-                fail:
-                  msg: "Application failed to start on port 3000. Check PM2 logs above."
-                when: wait_result is failed
-
-              - name: Configure Nginx
+              - name: Configure Nginx as reverse proxy
                 copy:
                   dest: /etc/nginx/sites-available/app
                   content: |
@@ -366,6 +349,26 @@ jobs:
                   state: restarted
                   enabled: yes
 
+              - name: Wait for application to be ready
+                wait_for:
+                  host: 127.0.0.1
+                  port: 3000
+                  timeout: 120
+                  delay: 10
+                ignore_errors: yes
+                register: app_wait
+
+              - name: Print PM2 logs on failure
+                shell: |
+                  pm2 logs app --lines 100 --nostream || true
+                when: app_wait.failed is defined and app_wait.failed
+                become_user: "{{ app_user }}"
+
+              - name: Fail if application did not start
+                fail:
+                  msg: "Application failed to start on port 3000. Check PM2 logs above."
+                when: app_wait.failed is defined and app_wait.failed
+
               - name: Print server IP
                 debug:
                   msg: "server_ip={{ ansible_host }}"
@@ -377,7 +380,7 @@ jobs:
         run: |
           SERVER_IP="${{ needs.provision.outputs.server_ip }}"
           ansible-playbook ansible/playbook.yml \
-            -i "$SERVER_IP," \
+            -i "${SERVER_IP}," \
             -u ubuntu \
             --private-key ~/.ssh/deploy_key \
             -e node_env_database_url='${{ secrets.DATABASE_URL }}' \
@@ -398,31 +401,25 @@ jobs:
     runs-on: ubuntu-latest
     needs: [provision, configure]
     steps:
-      - name: Check health endpoint
+      - name: Verify application health endpoint
         run: |
           SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          echo "Verifying deployment at http://$SERVER_IP/health"
+          echo "Verifying application at http://${SERVER_IP}/health ..."
           for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$SERVER_IP/health" 2>/dev/null || echo "000")
-            echo "Attempt $i/12 — HTTP status: $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed!"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${SERVER_IP}/health" || echo "000")
+            echo "Attempt $i: HTTP status ${STATUS}"
+            if [ "${STATUS}" = "200" ]; then
+              echo "Application is healthy!"
+              echo "Deployment URL: http://${SERVER_IP}"
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed after all attempts"
+          echo "ERROR: Application health check failed after all attempts."
           exit 1
 
-      - name: Print deployment URL
-        run: |
-          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          echo "Deployment successful!"
-          echo "Application URL: http://$SERVER_IP"
-          echo "Health URL: http://$SERVER_IP/health"
-
   notify:
-    name: Notify Deployment Status
+    name: Notify Deployment Result
     runs-on: ubuntu-latest
     needs: [provision, verify]
     if: always()
@@ -430,26 +427,25 @@ jobs:
       - name: Deployment success notification
         if: needs.verify.result == 'success'
         run: |
-          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          echo "========================================"
+          echo "=========================================="
           echo "Deployment SUCCEEDED"
           echo "Project : testweb4"
           echo "App     : node"
           echo "Region  : us-east-1"
-          echo "Server  : $SERVER_IP"
-          echo "URL     : http://$SERVER_IP"
-          echo "Health  : http://$SERVER_IP/health"
-          echo "========================================"
+          echo "Server  : ${{ needs.provision.outputs.server_ip }}"
+          echo "URL     : http://${{ needs.provision.outputs.server_ip }}"
+          echo "Health  : http://${{ needs.provision.outputs.server_ip }}/health"
+          echo "=========================================="
 
       - name: Deployment failure notification
         if: needs.verify.result != 'success'
         run: |
-          SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          echo "========================================"
+          echo "=========================================="
           echo "Deployment FAILED"
           echo "Project : testweb4"
           echo "App     : node"
           echo "Region  : us-east-1"
-          echo "Server  : $SERVER_IP"
-          echo "========================================"
+          echo "Server  : ${{ needs.provision.outputs.server_ip }}"
+          echo "Please check the workflow logs for details."
+          echo "=========================================="
           exit 1

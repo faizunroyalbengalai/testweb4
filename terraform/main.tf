@@ -13,26 +13,17 @@ provider "aws" {
 }
 
 variable "public_key" {
-  description = "SSH public key for EC2 access"
-  type        = string
+  type = string
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
-  type        = string
-  default     = "t3.micro"
+  type    = string
+  default = "t3.micro"
 }
 
 variable "app_name" {
-  description = "Application name"
-  type        = string
-  default     = "node"
-}
-
-variable "project_name" {
-  description = "Project name"
-  type        = string
-  default     = "testweb4"
+  type    = string
+  default = "testweb4-node"
 }
 
 data "aws_ami" "ubuntu" {
@@ -62,7 +53,7 @@ data "aws_subnets" "default" {
 }
 
 resource "aws_key_pair" "deployer" {
-  key_name   = "${var.project_name}-${var.app_name}-key"
+  key_name   = "${var.app_name}-key"
   public_key = var.public_key
 
   lifecycle {
@@ -71,8 +62,8 @@ resource "aws_key_pair" "deployer" {
 }
 
 resource "aws_security_group" "app_sg" {
-  name        = "${var.project_name}-${var.app_name}-sg"
-  description = "Security group for ${var.app_name} application"
+  name        = "${var.app_name}-sg"
+  description = "Security group for ${var.app_name}"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -87,14 +78,6 @@ resource "aws_security_group" "app_sg" {
     description = "HTTP"
     from_port   = 80
     to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS"
-    from_port   = 443
-    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -117,12 +100,6 @@ resource "aws_security_group" "app_sg" {
   lifecycle {
     create_before_destroy = true
   }
-
-  tags = {
-    Name    = "${var.project_name}-${var.app_name}-sg"
-    Project = var.project_name
-    App     = var.app_name
-  }
 }
 
 resource "aws_instance" "app" {
@@ -139,23 +116,20 @@ resource "aws_instance" "app" {
   }
 
   tags = {
-    Name    = "${var.project_name}-${var.app_name}"
-    Project = var.project_name
-    App     = var.app_name
+    Name    = var.app_name
+    Project = "testweb4"
+    App     = "node"
   }
 }
 
 output "instance_ip" {
-  description = "Public IP of the EC2 instance"
-  value       = aws_instance.app.public_ip
+  value = aws_instance.app.public_ip
 }
 
 output "instance_id" {
-  description = "EC2 instance ID"
-  value       = aws_instance.app.id
+  value = aws_instance.app.id
 }
 
-output "instance_dns" {
-  description = "Public DNS of the EC2 instance"
-  value       = aws_instance.app.public_dns
+output "ssh_user" {
+  value = "ubuntu"
 }
