@@ -67,7 +67,8 @@ resource "aws_key_pair" "deployer" {
   public_key = var.public_key
 
   lifecycle {
-    ignore_changes = [public_key]
+    ignore_changes  = [public_key]
+    create_before_destroy = true
   }
 }
 
